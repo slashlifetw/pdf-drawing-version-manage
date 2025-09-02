@@ -78,16 +78,36 @@ class Inf_file:
         self.filename = new_filename
 
 
-
+# Define regular expressions for supported filename formats
+# Format description: XX#-#-XXX##-X####-[version].pdf, version can be 1-2 digits or single English letter
 file_name_formats = [
-    r'(([A-Z]{2}\d{1}-\d{1}-[A-Z]{3}\d{2}-[A-Z]{1}\d{4})-([0-9]{1,2}|[A-Z])\.pdf)',
-    r'(([A-Z]{2}\d{1}-\d{1}-[A-Z]{3}\d{2}-[A-Z]{1}\d{4})-([0-9]{1,2}|[A-Z])-(Signed)\.pdf)',
-    r'(([A-Z]{2}\d{1}-\d{1}-[A-Z]{3}\d{2}-[A-Z]{1}\d{4})-([0-9]{1,2}|[A-Z])-(Searchable)\.pdf)'
+    r'(([A-Z]{2}\d{1}-\d{1}-[A-Z]{3}\d{2}-[A-Z]{1}\d{4})-([0-9]{1,2}|[A-Z])\.pdf)',             # Basic version
+    r'(([A-Z]{2}\d{1}-\d{1}-[A-Z]{3}\d{2}-[A-Z]{1}\d{4})-([0-9]{1,2}|[A-Z])-(Signed)\.pdf)',    # Signed version
+    r'(([A-Z]{2}\d{1}-\d{1}-[A-Z]{3}\d{2}-[A-Z]{1}\d{4})-([0-9]{1,2}|[A-Z])-(Searchable)\.pdf)' # Searchable version
 ]
 
+# Global veriable: Store found file information
 new_file = []
 
 def find_files(search_path, target_path, file_format, file_name_formats):
+    """
+    Search for files matching the format in the specified path and filter out the latest versions
+
+    This function recursively searches all PDF files in the specified directory, checks if filenames
+    match predifined formats, compares verson numbers and suffix priorities for files with the same name,
+    and keeps the latest and best quality version.
+
+    Args:
+        search_path (str): Root directory path to search
+        target_path (str): Target copy path
+        file_format (str): File format ('pdf')
+        file_name_formats (list): List containing regular expression for matching filename formats
+
+    Note:
+        - Numeric version number take priority over alphabetic version numbers
+        - For same versions: Searchable > Basic version > Signed version
+        - Search results are automatically copied to target path
+    """
     for root, dirs, files in os.walk(search_path):
         for filename in files:
             print('目前檔名', filename)
