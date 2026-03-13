@@ -1,301 +1,425 @@
-import os
-import shutil
-import re
-import time
+"""Automated Latest Version Extraction Tool for Design Drawing PDFs.
+
+This module automates the extraction of the latest versions of PDF design
+drawings from a designated directory tree. It is designed for construction
+project environments where vendors submit drawings with incremental version
+suffixes in standardized filenames.
+
+Key capabilities:
+    1. Recursively searches for PDF files matching a specific naming pattern.
+    2. Compares version identifiers and retains only the latest version per
+       drawing number.
+    3. Resolves ties between same-version files using a quality suffix
+       priority ranking (Searchable > Basic > Signed).
+    4. Copies all filtered latest-version files into a newly created output
+       folder within the source directory.
+
+Supported file naming formats:
+
+    Basic format:       XX#-#-XXX##-X####-[version].pdf
+    Singed version:     XX#-#-XXX##-X####-[version]-Signed.pdf
+    Searchable version: XX#-#-XXX##-X####-[version]-Searchable.pdf
+
+Where ''[version]'' is either a 1-2 digit integer or a single uppercase letter.
+
+Example filenames::
+
+    HT0-1-CIC01-D5026-1-Searchable.pdf
+    HT0-1-CIC01-C5023_A-Signed.pdf
+    HT0-1-CIC01-D5038-A.pdf
+
+Author: Michael; JIUN-AN, TSAI; 蔡濬安
+Version: 1.3
+Last Updated: 2026/03/13
+"""
+
 import datetime
-
+import os
+import re
+import shutil
+import time
 import tkinter as tk
-from tkinter import filedialog, Tk, messagebox
+from tkinter import filedialog, messagebox
 
-"""
-Automated Latest Version Extraction Tool for Design Drawing PDFs
 
-This Program is used for Automated Extraction of PDF files with specific namaing formats, capable of: 
-1.Searching for PDF files with specific naming pattern in designated directories 
-2.Comparing file versions and keeping the latest versions 
-3.Selecting the best quality files based on file suffix priority 
-4.Copying filtered latest version files to a newly created target folder
+# ---------------------------------------------------------------------------
+# Module-level constants
+# ---------------------------------------------------------------------------
 
-Supported file naming formats: 
-- Basic format: XX#-#-XXX##-X####-[version].pdf 
-- Singed version: XX#-#-XXX##-X####-[version]-Signed.pdf 
-- Searchable version: XX#-#-XXX##-X####-[version]-Searchable.pdf 
+# Regular expression patterns for each supported filename variant.
+# Each pattern captures three groups:
+#   Group 1: Full filename       (e.g. "HT0-1-CIC01-D5026-1-Searchable.pdf")
+#   Group 2: Base drawing number (e.g. "HT0-1-CIC01-D5026")
+#   Group 3: Version token       (numeric string or single letter, e.g. "3" or "A")
+#   Group 4: Suffix label        (Signed / Searchable variants only)
+FILE_NAME_FORMATS = [
+    r'(([A-Z]{2}\d{1}-\d{1}-[A-Z]{3}\d{2}-[A-Z]{1}\d{4})-([0-9]{1,2}|[A-Z])\.pdf)',
+    r'(([A-Z]{2}\d{1}-\d{1}-[A-Z]{3}\d{2}-[A-Z]{1}\d{4})-([0-9]{1,2}|[A-Z])-(Signed)\.pdf)',
+    r'(([A-Z]{2}\d{1}-\d{1}-[A-Z]{3}\d{2}-[A-Z]{1}\d{4})-([0-9]{1,2}|[A-Z])-(Searchable)\.pdf)'
+]
 
-Author: [Michael; JIUN-AN, TSAI; 蔡濬安]
-Version: 1.1
-Last Updated: 2025/09/01
+# Quality ranking for same-version files.
+# Higher value = preferred when version numbers are equal.
+SUFFIX_PRIORITY = {
+    'Searchable': 3,  # Searchable version
+    '': 2,            # Basic version
+    'Signed': 1       # Signed version
+}
 
-"""
 
-'''coding Update History: 
+# ---------------------------------------------------------------------------
+# Data model
+# ---------------------------------------------------------------------------
 
-20240516:
-    Update the search format in "file_name_formats" to allow for 1 or 2 unmbers or English alphabets, 
-    as the previous vertion only allowed searching for 1 unmber or English Alphabet.
-    - (([A-Z]{2}\d{1}-\d{1}-[A-Z]{3}\d{2}-[A-Z]{1}\d{4})-(\d|[A-Z])\.pdf) 
-        -> (([A-Z]{2}\d{1}-\d{1}-[A-Z]{3}\d{2}-[A-Z]{1}\d{4})-([0-9]{1,2}|[A-Z])\.pdf)
-    - (([A-Z]{2}\d{1}-\d{1}-[A-Z]{3}\d{2}-[A-Z]{1}\d{4})-(\d|[A-Z])-(Signed)\.pdf) 
-        -> (([A-Z]{2}\d{1}-\d{1}-[A-Z]{3}\d{2}-[A-Z]{1}\d{4})-([0-9]{1,2}|[A-Z])-(Signed)\.pdf)
-    - (([A-Z]{2}\d{1}-\d{1}-[A-Z]{3}\d{2}-[A-Z]{1}\d{4})-(\d|[A-Z])-(Searchable)\.pdf) 
-        -> (([A-Z]{2}\d{1}-\d{1}-[A-Z]{3}\d{2}-[A-Z]{1}\d{4})-([0-9]{1,2}|[A-Z])-(Searchable)\.pdf)
-'''
+class FileInfo:
+    """File information container for a single tracked PDF drawing file.
 
-class Inf_file:
+    When multiple files share the same drawings name, only one
+    ''FileInfo'' is kept in the tracking list; its attributes
+    are overwritten whenever a superior version is encountered.
+
+    Attributes:
+        base_name (str): Base name of the file (without version and suffix)
+            e.g. ''"HT0-1-CIC01-D5038"''.
+        version (str): Raw version token as extracted from the filename,
+            e.g. ``"3"`` or ``"B"``.
+        suffix (str): File suffix, one of ``"Searchable"``, ``"Signed"``,
+            or ``""`` for files.
+        file_path (str): Absolute filesystem path to the physical PDF file.
+        full_filename (str): Complete filename,
+            e.g. ''"HT0-1-CIC01-D5026-1-Searchable.pdf"''.
     """
-    File Information Class
 
-    Used to store and manage information related to PDF files, including file name, version, suffix, etc.
-    """
-    def __init__(self, name, version, suffix, pathfile, filename):
-        """
-        Initialize file information object
+    def __init__(
+        self,
+        base_name: str,
+        version: str,
+        suffix: str,
+        file_path: str,
+        full_filename: str,
+    ) -> None:
+        """Initialise a FileInfo instance with all required attributes.
 
         Args:
-            name (str): Base name of the file (without version number and suffix)
-            version (str): File version number
-            suffix (str): File suffix (such as 'Signed', 'Searchable' or empty string)
-            pathfile (str): Complete path of file
-            filename (str): Complete filename
+            base_name: Drawing identifier without version/suffix component.
+            version: Version token extracted from the filename.
+            suffix: File suffix label (``"Searchable"``, ``"Signed"``,
+                or empty string).
+            file_path: Absolute path to the PDF file on disk.
+            full_filename: Complete filename string including the extension.
         """
-        self.name = name
+        self.base_name = base_name
         self.version = version
         self.suffix = suffix
-        self.pathfile = pathfile
-        self.filename = filename
-    def update_inf(self, new_version, new_suffix, new_pathfile, new_filename):
-        """
-        Update file information
+        self.file_path = file_path
+        self.full_filename = full_filename
+
+    def update_inf(
+        self,
+        new_version: str,
+        new_suffix: str,
+        new_file_path: str,
+        new_full_filename: str,
+    ) -> None:
+        """Replace stored metadata with data from a superior file version.
+
+        Called when the comparison logic determines that a newly discovered
+        file should supersede the currently tracked entry.
 
         Args:
-            new_version (str): New version number
-            new_suffix (str): New file suffix
-            new_pathfile (str): New file path
-            new_filename (str): New filename
+            new_version: Updated version token.
+            new_suffix: Updated quality suffix.
+            new_file_path: Absolute path to the superior file.
+            new_full_filename: Complete filename of the superior file.
         """
         self.version = new_version
         self.suffix = new_suffix
-        self.pathfile = new_pathfile
-        self.filename = new_filename
+        self.file_path = new_file_path
+        self.full_filename = new_full_filename
 
 
-# Define regular expressions for supported filename formats
-# Format description: XX#-#-XXX##-X####-[version].pdf, version can be 1-2 digits or single English letter
-file_name_formats = [
-    r'(([A-Z]{2}\d{1}-\d{1}-[A-Z]{3}\d{2}-[A-Z]{1}\d{4})-([0-9]{1,2}|[A-Z])\.pdf)',             # Basic version
-    r'(([A-Z]{2}\d{1}-\d{1}-[A-Z]{3}\d{2}-[A-Z]{1}\d{4})-([0-9]{1,2}|[A-Z])-(Signed)\.pdf)',    # Signed version
-    r'(([A-Z]{2}\d{1}-\d{1}-[A-Z]{3}\d{2}-[A-Z]{1}\d{4})-([0-9]{1,2}|[A-Z])-(Searchable)\.pdf)' # Searchable version
-]
+# ---------------------------------------------------------------------------
+# Core logic
+# ---------------------------------------------------------------------------
 
-# Global veriable: Store found file information
-new_file = []
+def find_files(
+    search_path: str,
+    target_path: str,
+    file_format: str,
+    file_name_formats: list[str],
+) -> None:
+    """Search *search_path* recursively and copy the latest drawing versions.
 
-def find_files(search_path, target_path, file_format, file_name_formats):
-    """
-    Search for files matching the format in the specified path and filter out the latest versions
+    For every PDF whose filename matches one of the patterns in
+    *file_name_formats*, the function:
 
-    This function recursively searches all PDF files in the specified directory, checks if filenames
-    match predifined formats, compares verson numbers and suffix priorities for files with the same name,
-    and keeps the latest and best quality version.
+    1. Parses the base drawing number, version token, and quality suffix.
+    2. Checks whether a file with the same base name has already been seen.
+    3. If not, registers a new ``FileInfo`` entry in the local registry.
+    4. If a prior entry exists, delegates to :func:`_compare_and_update` to
+       decide whether the new file should replace the stored one.
+
+    After the full walk completes, every surviving entry is copied to
+    *target_path* via :func:`copy_file`.
+
+    Version comparison rules (in descending priority):
+
+    * Numeric versions always beat alphabetic versions (``"3"`` > ``"B"``).
+    * Among two numeric versions, the larger integer wins.
+    * Among two alphabetic versions, the lexicographically larger letter wins.
+    * For equal versions, ``SUFFIX_PRIORITY`` determines the winner.
 
     Args:
-        search_path (str): Root directory path to search
-        target_path (str): Target copy path
-        file_format (str): File format ('pdf')
-        file_name_formats (list): List containing regular expression for matching filename formats
-
-    Note:
-        - Numeric version number take priority over alphabetic version numbers
-        - For same versions: Searchable > Basic version > Signed version
-        - Search results are automatically copied to target path
+        search_path: Root directory from which the recursive search begins.
+        target_path: Destination directory where winning files are copied.
+        file_format: File extension to filter on, without the dot (e.g. ``"pdf"``).
+        file_name_formats: List of regex strings used to validate and parse
+            candidate filenames.
     """
-    for root, dirs, files in os.walk(search_path):
+    file_registry: list[FileInfo] = []
+
+    for root, _, files in os.walk(search_path):
         for filename in files:
-            print('目前檔名', filename)
-            # 只選擇檔案是pdf
-            if filename.endswith(file_format):
-                # 如果檔案與我們要的格式相符，就暫存
-                for regex in file_name_formats:
-                    match = re.match(regex, filename)
-                    if match != None:
 
-                        now_name = match.group(2)
-                        now_version = match.group(3)
-
-                        now_groups = match.groups()
-                        if len(now_groups) == 4 and now_groups[3]:
-                            now_suffix = now_groups[3]
-                        else:
-                            now_suffix = ''
-
-                        now_fillname = match.group(1)
-                        now_file_path = os.path.join(root, filename)
-
-                        print('目前檔案：', match)                    
-                        print('目前檔名：', now_name)                        
-                        print('目前版本：', now_version)                   
-                        print('目前尾數：', now_suffix)                
-                        print('目前檔案路徑：', now_file_path)
-                        print('目前檔案全名：', now_fillname)
-
-                        # determine whether the new_file list has data
-                        if len(new_file) == 0:
-                            _ = Inf_file(now_name, now_version, now_suffix, now_file_path, now_fillname)
-                            new_file.append(_)
-                            
-                        else:
-                            # determine whether the file name exists in the new_file list
-                            for _ in new_file:
-                                if _.name == now_name:
-                                    exist_name = 'Ture'
-                                    exist_obj = _
-                                    break
-                                else:
-                                    exist_name = 'Flase'
-                                    exist_obj = _
-                            print('目前檔名是否存在於list內：', exist_name)
-                            print('目前class名稱：', exist_obj)
-                                
-                            
-                            if exist_name == 'Ture':
-
-                                # obtain relevant information about the current original file name 
-                                origin_name = exist_obj.name
-                                origin_version = exist_obj.version
-                                origin_suffix = exist_obj.suffix
-                                origin_filename = exist_obj.filename
-
-                                if origin_version.isdigit():
-                                    temorigin_versionformat = int(origin_version)
-                                else:
-                                    temorigin_versionformat = origin_version
-
-                                if now_version.isdigit():
-                                    temnow_versionformat = int(now_version)
-                                else:
-                                    temnow_versionformat = now_version
-
-                                print('現在檔名：', now_name)
-                                print('現在版本', now_version)
-                                print('目前版本是否為數字：', now_version.isdigit())
-
-                                print('原始檔名：', exist_obj.name)                                
-                                print('原始版本：', exist_obj.version)
-                                print('原始版本是否為數字：', origin_version.isdigit())
-                                                                                                              
-                                                                
-                                if isinstance(temorigin_versionformat, int) and isinstance(temnow_versionformat, int) and temorigin_versionformat <= temnow_versionformat : 
-                                    print('原始版本比較小')
-                                    version_update(temnow_versionformat, now_suffix, now_file_path, now_fillname, temorigin_versionformat, exist_obj)
-                                elif isinstance(temorigin_versionformat, str) and isinstance(temnow_versionformat, int):
-                                    print('原始版本是字串，現在版本是數字')
-                                    version_update(now_version, now_suffix, now_file_path, now_fillname, origin_version, exist_obj)
-                                elif isinstance(temorigin_versionformat, str) and isinstance(temnow_versionformat, str) and temorigin_versionformat <= temnow_versionformat:
-                                    print('原始版本/現在版本都是字串，但現在本版字串大於等於原版本')
-                                    version_update(now_version, now_suffix, now_file_path, now_fillname, origin_version, exist_obj)
-                                else:
-                                    continue
-
-                            # new_file list dosen't have the same file name, crate.
-                            elif exist_name == 'Flase':
-                                name = Inf_file(now_name, now_version, now_suffix, now_file_path, now_fillname)
-                                print('印出檔名：', now_name)
-                                new_file.append(name)
-                                    
-                            for _ in new_file:
-                                print('list目前class名稱：', _)
-                                print('list目前檔名', _.name)
-                                print('list目前版本', _.version)
-                                print('list目前尾碼', _.suffix)
-                                print('list目前路徑', _.pathfile)
-
-            else:
+            # Pre-filter: skip non-PDF files immediately
+            if not filename.endswith(file_format):
                 continue
 
-    
-    for _ in new_file:
-        name_pathfile = _.pathfile
-        filename = _.filename
-        copy_file(name_pathfile, target_path, filename)
+            # Pattern matching: try each regex in turn
+            match = None
+            for regex in file_name_formats:
+                match = re.fullmatch(regex, filename)
+                if match:
+                    break
+
+            # Skip filenames that don't conform to any known format
+            if not match:
+                continue
+
+            # Extract structured matadata from the regex groups
+            now_name = match.group(2)     # Base drawing number
+            now_version = match.group(3)  # Version token (digit(s) or letter)
+            now_groups = match.groups()
+
+            # Group index 3 is only present for ''/ Singed/ Searchable variants
+            now_suffix = now_groups[3] if len(now_groups) == 4 and now_groups[3] else ''
+
+            now_full_name = match.group(1)
+            now_file_path = os.path.join(root, filename)
+
+            # Search for an existing entry with the same drawing base name
+            existing_entry = None
+            for entry in file_registry:
+                if entry.base_name == now_name:
+                    existing_entry = entry
+                    break
+
+            if existing_entry is None:
+                # No entry for this drawing yet - register it
+                file_registry.append(
+                    FileInfo(now_name,
+                             now_version,
+                             now_suffix,
+                             now_file_path,
+                             now_full_name)
+                )
+            else:
+                # An entry already exists; determine whether to replace it
+                _compare_and_update(
+                    entry, now_version, now_suffix,
+                    now_file_path, now_full_name
+                )
+
+    # Copy all surviving files to the output folder
+    for entry in file_registry:
+        copy_file(entry.file_path, target_path, entry.full_filename)
 
 
-def version_update(version, suffix, file_path, filename, origin_version, classname):
-    if version > origin_version:
-        print('現在版本大於原版本，更新覆蓋....')           
-        classname.version = str(version)
-        classname.suffix = suffix
-        classname.pathfile = file_path
-        classname.filename = filename
-    elif not str(origin_version).isdigit() and str(version).isdigit():
-        print('原版本是英文，目前版本為數字，更新覆蓋.......')
-        classname.version = version
-        classname.suffix = suffix
-        classname.pathfile = file_path
-        classname.filename = filename
-    elif version == origin_version:
-        print('原版本與現有本版相同，但解析度不同.....')
-        if suffix == 'Searchable' and classname.suffix != 'Searchable':
-            print('現在解析度為最高，原解析度非最高，更新中............')
-            classname.suffix = suffix
-            classname.pathfile = file_path
-            classname.filename = filename
+def _compare_and_update(
+    existing: FileInfo,
+    now_version: str,
+    now_suffix: str,
+    now_file_path: str,
+    now_full_filename: str,
+) -> None:
+    """Compare a newly found file against the currently registered entry.
 
-        elif suffix == '' and classname.suffix == 'Signed':
-            print('原版本原Scan檔，現在版本解析度較大，更新中...........')
-            classname.suffix = ''
-            classname.pathfile = file_path
-            classname.filename = filename
+    Normalises both version tokens and delegates to :func:`version_update`
+    when the new file should replace the stored one.
 
-def copy_file(name_pathfile, target_path, filename):
-    new_source_path = os.path.join(name_pathfile)
-    new_target_path = os.path.join(target_path, filename)
-    print('檔案來源：', new_source_path)
-    print('要移動的路徑及檔名：', new_target_path)
-    shutil.copyfile(new_source_path, new_target_path)
+    Comparison logic (evaluated in order):
+
+    1. **Both numeric** – new wins if its integer value >= existing integer.
+    2. **Existing alphabetic, new numeric** – numeric always supersedes.
+    3. **Both alphabetic** – new wins if its letter >= existing letter.
+    4. **Existing numeric, new alphabetic** – keep existing (no action).
+
+    Args:
+        existing: The ``FileInfo`` instance currently stored in the registry.
+        now_version: Version token of the newly discovered file.
+        now_suffix: Quality suffix of the newly discovered file.
+        now_file_path: Absolute path to the newly discovered file.
+        now_full_filename: Complete filename of the newly discovered file.
+    """
+    # Normalise version token for comparsion
+    origin_version_is_numeric = existing.version.isdigit()
+    now_version_is_numeric = now_version.isdigit()
+
+    origin_version_comparable = int(existing.version) if origin_version_is_numeric else existing.version
+    now_version_comparable = int(now_version) if now_version_is_numeric else now_version
+
+    if isinstance(origin_version_comparable, int) and isinstance(now_version_comparable, int):
+        # Both numeric: larger integer (or same version with better suffix) wins
+        if now_version_comparable >= origin_version_comparable:
+            version_update(existing, now_version_comparable, now_suffix, now_file_path, now_full_filename, origin_version_comparable)
+
+    elif not origin_version_is_numeric and now_version_is_numeric:
+        # Numeric always supersedes alphabetic
+        version_update(existing, now_version, now_suffix, now_file_path, now_full_filename, existing.version)
+
+    elif not origin_version_is_numeric and not now_version_is_numeric:
+        if now_version_comparable >= origin_version_comparable:
+            version_update(existing, now_version, now_suffix, now_file_path, now_full_filename, existing.version)
+    # Remaining case (existing numeric, new alphabetic): keep existing – no action needed.
 
 
-def open_dir():
+def version_update(
+    existing_entry: FileInfo,
+    new_version,
+    new_suffix: str,
+    new_file_path: str,
+    new_full_filename: str,
+    origin_version,
+) -> None:
+    """Overwrite a registered ''FileInfo'' entry if the new file is superior.
+
+    Evaluates two sub-cases:
+
+    * **Version greater** - replacement.
+    * **Version equal** - replacement only when *new_suffix* has a higher
+      ``SUFFIX_PRIORITY`` value than the currently stored suffix(origin_suffix).
+
+    Args:
+        existing_entry: The ``FileInfo`` object to overwrite.
+        new_version: Comparable version token for the new file (may be
+            ``int`` or ``str`` depending on caller).
+        new_suffix: Quality suffix of the new file.
+        new_file_path: Absolute path of the new file.
+        new_full_filename: Complete filename of the new file.
+        origin_version: Comparable version token for the existing file.
+    """
+    if new_version > origin_version:
+        # New file has a higher version token
+        existing_entry.update_inf(str(new_version), new_suffix, new_file_path, new_full_filename)
+    elif not str(origin_version).isdigit() and str(new_version).isdigit():
+        # Alphabetic -> numeric upgrade
+        existing_entry.update_inf(str(new_version), new_suffix, new_file_path, new_full_filename)
+    elif new_version == origin_version:
+        # Same version; Compare the priority of suffix
+        num_new_suffix = SUFFIX_PRIORITY.get(new_suffix)
+        num_origin_suffix = SUFFIX_PRIORITY.get(existing_entry.suffix)
+        if num_new_suffix > num_origin_suffix:
+            existing_entry.update_inf(str(new_version), new_suffix, new_file_path, new_full_filename)
+
+
+def copy_file(
+    source_path: str,
+    target_dir: str,
+    filename: str,
+) -> None:
+    """Copy a single file form *source_path* into *target_dir*.
+
+    The destination filename is always the same as the source filename
+
+    Args:
+        source_path: Absolute path of the file to copy.
+        target_dir: Destination directory; must already exist.
+        filename: Filename to use at the destination.
+    """
+    destination_path = os.path.join(target_dir, filename)
+    print(f'  [COPY] {source_path}')
+    print(f'      → {destination_path}')
+    shutil.copyfile(source_path, destination_path)
+
+
+# ---------------------------------------------------------------------------
+# GUI helpers
+# ---------------------------------------------------------------------------
+
+def prepare_directories() -> tuple[str, str]:
+    """Present a folder-selection dialog and prepare the output directory.
+
+    Workflow:
+
+    1. Opens a native folder-picker dialog for the user to choose the root
+       search directory.
+    2. Removes any pre-existing ``★★★最新版本(...)★★★`` subfolder to avoid
+       stale results accumulating across runs.
+    3. Creates a freshly named output folder stamped with today's date.
+
+    Returns:
+        A two-tuple ``(search_path, target_path)`` where *search_path* is the
+        user-selected root directory and *target_path* is the newly created
+        output subfolder.
+    """
+    # Initiallise a hidden Tk root window (required by tkinter dialogs)
     window_root = tk.Tk()
     window_root.withdraw()
-    choose_folder_path = filedialog.askdirectory()
+
+    # the user selects the root search folder
+    choose_folder_path = filedialog.askdirectory(title="選擇要收尋的資料夾")
 
     today_date = datetime.date.today()
-    new_folder_path = os.path.join(choose_folder_path, '★★★最新版本({}更新)★★★'.format(today_date))
 
-    folders = os.listdir(choose_folder_path)
+    # Remove stale output folders from previous runs
+    for folder_name in os.listdir(choose_folder_path):
+        full_folder_path = os.path.join(choose_folder_path, folder_name)
+        if '最新版本' in folder_name and os.path.isdir(full_folder_path):
+            shutil.rmtree(full_folder_path)
+            messagebox.showinfo('Success', f'{folder_name}舊資料夾已刪除。')
 
-    delete_folders = []
-    for _ in folders:
-        if '最新版本' in _:
-            delete_folders.append(_)
-        else:
-            continue
-
-    if len(delete_folders) == 0:
-        messagebox.showinfo('Information', 'There is no ★★★最新版本★★★ of relrvant Folder')
-    else:
-        for _ in delete_folders:
-            folder_to_delete = os.path.join(choose_folder_path, _)
-            shutil.rmtree(folder_to_delete)
-            messagebox.showinfo('Success', '{} Folder have been deleted.'.format(_))
+    # Create the new dated output folder
+    new_folder_name = f'★★★最新版本({today_date}更新)★★★'
+    new_folder_path = os.path.join(choose_folder_path, new_folder_name)
     os.makedirs(new_folder_path)
-    messagebox.showinfo('Success', 'Create new ★★★最新版本({}更新)★★★ Folder.'.format(today_date))        
+    messagebox.showinfo('Success', f'已建立新資料夾:{new_folder_name}')
 
-    return (choose_folder_path, new_folder_path)
+    return choose_folder_path, new_folder_path
 
-def main():
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+
+def main() -> None:
+    """The full extraction workflow.
+
+    Steps:
+
+    1. Prompt the user to choose a root directory via :func:`prepare_directories`.
+    2. Run :func:`find_files` to collect and copy the latest drawing versions.
+    3. Display a completion message with the elapsed wall-clock time.
+
+    Any un-handled exception is caught and surfeaced to the user through a
+    ''tkinter'' error dialog.
+    """
     try:
-        start_time = time.time()    
-        result_path = open_dir()
-        search_path = result_path[0]
-        target_path = result_path[1]
+        start_time = time.time()
+
+        # Obtain search root and freshly created output floder
+        search_path, target_path = prepare_directories()
         file_format = 'pdf'
 
-        find_files(search_path, target_path, file_format, file_name_formats)
-        end_time = time.time()
-        print('本次執行程式共花：', round(end_time - start_time, 2), 'sec')
-        messagebox.showinfo('Information', '本次執行程式共花：{} sec'.format(round(end_time - start_time, 2)))
-    except Exception as _:
-        messagebox.showerror('Error', 'An error occurred:{}'.format(_))
+        # Perform the main extraction logic
+        find_files(search_path, target_path, file_format, FILE_NAME_FORMATS)
+
+        # Report completion time
+        elapsed_time = round(time.time() - start_time, 2)
+        print(f'執行完成，耗時：{elapsed_time} sec')
+        messagebox.showinfo('Sucess', f'程式執行完成\n耗時:{elapsed_time} sec')
+
+    except Exception as exc:
+        messagebox.showerror('Error', f'程式執行發生錯誤:{exc}')
 
 
 if __name__ == '__main__':
