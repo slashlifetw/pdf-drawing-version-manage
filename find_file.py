@@ -17,7 +17,7 @@ Key capabilities:
 Supported file naming formats:
 
     Basic format:       XX#-#-XXX##-X####-[version].pdf
-    Singed version:     XX#-#-XXX##-X####-[version]-Signed.pdf
+    Signed version:     XX#-#-XXX##-X####-[version]-Signed.pdf
     Searchable version: XX#-#-XXX##-X####-[version]-Searchable.pdf
 
 Where ''[version]'' is either a 1-2 digit integer or a single uppercase letter.
@@ -29,8 +29,8 @@ Example filenames::
     HT0-1-CIC01-D5038-A.pdf
 
 Author: Michael; JIUN-AN, TSAI; 蔡濬安
-Version: 1.3.1
-Last Updated: 2026/03/13
+Version: 1.4
+Last Updated: 2026/03/16
 """
 
 import datetime
@@ -39,7 +39,7 @@ import re
 import shutil
 import time
 import tkinter as tk
-from tkinter import filedialog, messagebox
+from tkinter import filedialog, messagebox, ttk
 
 
 # ---------------------------------------------------------------------------
@@ -139,6 +139,132 @@ class FileInfo:
 
 
 # ---------------------------------------------------------------------------
+# ★ Progress window — 全新新增
+# ---------------------------------------------------------------------------
+
+class ProgressWindow:
+    """A live progress window displayed during the file extraction workflow.
+
+    Shows real-time status while find_files() is running, including the
+    current directory being scanned, the number of files processed, and
+    a progress bar for the copy phase.
+
+    The progress bar runs in indeterminate (marquee) mode during the scan
+    phase and automatically switches to determinate mode when copying begins.
+
+    The window disables manual closing; it must be dismissed programmatically
+    by calling close() upon completion or when an exception is raised.
+
+    Attributes:
+        root (tk.Toplevel): The Toplevel window instance for this dialog.
+        _stage_var (tk.StringVar): Text variable for the current stage label.
+        _folder_var (tk.StringVar): Text variable for the current scan folder.
+        _file_var (tk.StringVar): Text variable for the scanned/matched file
+            counts.
+        _bar (ttk.Progressbar): Progress bar widget; indeterminate during
+            scanning, determinate during copying.
+    """
+
+    def __init__(self, parent: tk.Tk) -> None:
+        """Initialise and display the progress window.
+
+        Args:
+            parent: The hidden root Tk window to attach this Toplevel to.
+        """
+        self.root = tk.Toplevel(parent)
+        self.root.title('圖說最新版本抓取工具')
+        self.root.resizable(False, False)
+        self.root.protocol('WM_DELETE_WINDOW', lambda: None)
+
+        self.root.geometry('420x180')
+        self.root.update_idletasks()
+        x = (self.root.winfo_screenwidth() - 420) // 2
+        y = (self.root.winfo_screenheight() - 180) // 2
+        self.root.geometry(f'420x180+{x}+{y}')
+
+        frame = tk.Frame(self.root, padx=24, pady=20)
+        frame.pack(fill=tk.BOTH, expand=True)
+
+        self._stage_var = tk.StringVar(value='正在初始化...')
+        tk.Label(frame, textvariable=self._stage_var,
+                 font=('Microsoft JhengHei', 10, 'bold'),
+                 anchor='w').pack(fill=tk.X)
+
+        self._folder_var = tk.StringVar(value='')
+        tk.Label(frame, textvariable=self._folder_var,
+                 font=('Microsoft JhengHei', 9), fg='gray',
+                 anchor='w', wraplength=370,
+                 justify='left').pack(fill=tk.X, pady=(4, 0))
+
+        self._file_var = tk.StringVar(value='')
+        tk.Label(frame, textvariable=self._file_var,
+                 font=('Microsoft JhengHei', 9), fg='gray',
+                 anchor='w').pack(fill=tk.X, pady=(2, 10))
+
+        self._bar = ttk.Progressbar(frame, mode='indeterminate', length=370)
+        self._bar.pack(fill=tk.X)
+        self._bar.start(12)
+
+        self.root.update()
+
+    def set_stage(self, text: str) -> None:
+        """Update the stage label text.
+
+        Args:
+            text: Description of the current execution stage,
+                e.g. 'Scanning drawing folders...'.
+        """
+        self._stage_var.set(text)
+        self.root.update()
+
+    def set_folder(self, folder: str) -> None:
+        """Update the currently scanned folder path.
+
+        Displays only the last two path components to keep the label concise.
+
+        Args:
+            folder: Absolute path of the folder currently being walked.
+        """
+        parts = folder.replace('\\', '/').split('/')
+        short = '/'.join(parts[-2:]) if len(parts) >= 2 else folder
+        self._folder_var.set(f'📁 {short}')
+        self.root.update()
+
+    def set_file_count(self, scanned: int, matched: int) -> None:
+        """Update the scanned and matched file counters.
+
+        Args:
+            scanned: Total number of PDF files scanned so far.
+            matched: Number of files that matched a known naming format.
+        """
+        self._file_var.set(f'已掃描 {scanned} 個 PDF，符合格式 {matched} 個')
+        self.root.update()
+
+    def switch_to_copy(self, total: int) -> None:
+        """Switch the progress bar from indeterminate to determinate mode.
+
+        Called once scanning is complete and copying is about to begin.
+
+        Args:
+            total: Total number of files to be copied; sets the progress
+                bar maximum.
+        """
+        self._bar.stop()
+        self._bar.config(mode='determinate', maximum=total, value=0)
+        self.set_stage(f'正在複製最新版本（共 {total} 份）...')
+        self.root.update()
+
+    def increment_copy(self) -> None:
+        """Advance the progress bar by one step after each file is copied."""
+        self._bar.step(1)
+        self.root.update()
+
+    def close(self) -> None:
+        """Destroy the progress window and release its resources."""
+        self.root.destroy()
+
+
+# ---------------------------------------------------------------------------
 # Core logic
 # ---------------------------------------------------------------------------
 
@@ -147,6 +273,7 @@ def find_files(
     target_path: str,
     file_format: str,
     file_name_formats: list[str],
+    progress: ProgressWindow | None = None,
 ) -> None:
     """Search *search_path* recursively and copy the latest drawing versions.
 
@@ -175,15 +302,25 @@ def find_files(
         file_format: File extension to filter on, without the dot (e.g. ``"pdf"``).
         file_name_formats: List of regex strings used to validate and parse
             candidate filenames.
+        progress: Optional ProgressWindow instance for live status updates.
+              Pass ``None`` to run silently (default).
     """
     file_registry: list[FileInfo] = []
+    scanned = 0
+    matched = 0
 
     for root, _, files in os.walk(search_path):
+
+        if progress:
+            progress.set_folder(root)
+
         for filename in files:
 
             # Pre-filter: skip non-PDF files immediately
             if not filename.endswith(file_format):
                 continue
+
+            scanned += 1
 
             # Pattern matching: try each regex in turn
             match = None
@@ -196,12 +333,17 @@ def find_files(
             if not match:
                 continue
 
+            matched += 1
+
+            if progress:
+                progress.set_file_count(scanned, matched)
+
             # Extract structured matadata from the regex groups
             now_name = match.group(2)     # Base drawing number
             now_version = match.group(3)  # Version token (digit(s) or letter)
             now_groups = match.groups()
 
-            # Group index 3 is only present for ''/ Singed/ Searchable variants
+            # Group index 3 is only present for ''/ Signed/ Searchable variants
             now_suffix = now_groups[3] if len(now_groups) == 4 and now_groups[3] else ''
 
             now_full_name = match.group(1)
@@ -230,9 +372,14 @@ def find_files(
                     now_file_path, now_full_name
                 )
 
+    if progress:
+        progress.switch_to_copy(len(file_registry))
+
     # Copy all surviving files to the output folder
     for entry in file_registry:
         copy_file(entry.file_path, target_path, entry.full_filename)
+        if progress:
+            progress.increment_copy()
 
 
 def _compare_and_update(
@@ -346,7 +493,7 @@ def copy_file(
 # GUI helpers
 # ---------------------------------------------------------------------------
 
-def prepare_directories() -> tuple[str, str]:
+def prepare_directories(parent: tk.Tk) -> tuple[str, str]:
     """Present a folder-selection dialog and prepare the output directory.
 
     Workflow:
@@ -362,12 +509,12 @@ def prepare_directories() -> tuple[str, str]:
         user-selected root directory and *target_path* is the newly created
         output subfolder.
     """
-    # Initiallise a hidden Tk root window (required by tkinter dialogs)
-    window_root = tk.Tk()
-    window_root.withdraw()
 
     # the user selects the root search folder
-    choose_folder_path = filedialog.askdirectory(title="選擇要收尋的資料夾")
+    choose_folder_path = filedialog.askdirectory(
+        title="選擇要收尋的資料夾", parent=parent)
+    if not choose_folder_path:
+        raise RuntimeError('未選擇資料夾，程式結束。')
 
     today_date = datetime.date.today()
 
@@ -396,21 +543,34 @@ def main() -> None:
 
     Steps:
 
-    1. Prompt the user to choose a root directory via :func:`prepare_directories`.
-    2. Run :func:`find_files` to collect and copy the latest drawing versions.
-    3. Display a completion message with the elapsed wall-clock time.
+    1. Initialise a hidden Tk root window.
+    2. Prompt the user to choose a root directory via prepare_directories.
+    3. Display a ProgressWindow and run find_files to collect and copy
+       the latest drawing versions.
+    4. Display a completion message with the elapsed wall-clock time.
 
     Any un-handled exception is caught and surfeaced to the user through a
     ''tkinter'' error dialog.
     """
+    root = tk.Tk()
+    root.withdraw()
+
+    progress = None
+
     try:
         # Obtain search root and freshly created output floder
-        search_path, target_path = prepare_directories()
+        search_path, target_path = prepare_directories(root)
+        progress = ProgressWindow(root)
+        progress.set_stage('正在掃描圖說資料夾...')
         file_format = 'pdf'
 
         # Perform the main extraction logic
         start_time = time.time()
-        find_files(search_path, target_path, file_format, FILE_NAME_FORMATS)
+        find_files(search_path, target_path, file_format, FILE_NAME_FORMATS
+                   , progress)
+
+        progress.close()
+        progress = None
 
         # Report completion time
         elapsed_time = round(time.time() - start_time, 2)
@@ -418,7 +578,12 @@ def main() -> None:
         messagebox.showinfo('Sucess', f'程式執行完成\n耗時:{elapsed_time} sec')
 
     except Exception as exc:
+        if progress:
+            progress.close()
         messagebox.showerror('Error', f'程式執行發生錯誤:{exc}')
+
+    finally:
+        root.destroy()
 
 
 if __name__ == '__main__':
