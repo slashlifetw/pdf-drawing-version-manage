@@ -29,7 +29,7 @@ Example filenames::
     HT0-1-CIC01-D5038-A.pdf
 
 Author: Michael; JIUN-AN, TSAI; 蔡濬安
-Version: 1.3
+Version: 1.3.1
 Last Updated: 2026/03/13
 """
 
@@ -404,13 +404,12 @@ def main() -> None:
     ''tkinter'' error dialog.
     """
     try:
-        start_time = time.time()
-
         # Obtain search root and freshly created output floder
         search_path, target_path = prepare_directories()
         file_format = 'pdf'
 
         # Perform the main extraction logic
+        start_time = time.time()
         find_files(search_path, target_path, file_format, FILE_NAME_FORMATS)
 
         # Report completion time
